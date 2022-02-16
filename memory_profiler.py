@@ -3,7 +3,7 @@
 # .. we'll use this to pass it to the child script ..
 _CLEAN_GLOBALS = globals().copy()
 
-__version__ = '0.59.0'
+__version__ = '0.60.0'
 
 _CMD_USAGE = "python -m memory_profiler script_file.py"
 
@@ -15,14 +15,12 @@ import inspect
 import linecache
 import logging
 import os
-import io
 import pdb
 import subprocess
 import sys
 import time
 import traceback
 import warnings
-
 
 if sys.platform == "win32":
     # any value except signal.CTRL_C_EVENT and signal.CTRL_BREAK_EVENT
@@ -883,6 +881,39 @@ def show_results(prof, stream=None, precision=1):
         stream.write(u'\n\n')
 
 
+def show_results_from_statistics(stats, stream=None, precision=1):
+    if stream is None:
+        stream = sys.stdout
+    template = '{0:>6} {1:>12} {2:>12}  {3:>10}   {4:<}'
+
+    for (filename, lines) in stats:
+        header = template.format('Line #', 'Mem usage', 'Increment', 'Occurrences',
+                                 'Line Contents')
+
+        stream.write(u'Filename: ' + filename + '\n\n')
+        stream.write(header + u'\n')
+        stream.write(u'=' * len(header) + '\n')
+
+        all_lines = linecache.getlines(filename)
+
+        float_format = u'{0}.{1}f'.format(precision + 4, precision)
+        template_mem = u'{0:' + float_format + '} MiB'
+        for (lineno, mem) in lines:
+            if mem:
+                inc = mem[0]
+                total_mem = mem[1]
+                total_mem = template_mem.format(total_mem)
+                occurrences = mem[2]
+                inc = template_mem.format(inc)
+            else:
+                total_mem = u''
+                inc = u''
+                occurrences = u''
+            tmp = template.format(lineno, total_mem, inc, occurrences, all_lines[lineno - 1])
+            stream.write(tmp)
+        stream.write(u'\n\n')
+
+
 def _func_exec(stmt, ns):
     # helper for magic_memit, just a function proxy for the exec
     # statement
@@ -1112,7 +1143,7 @@ class MemoryProfilerMagics(Magics):
             counter += 1
             tmp = memory_usage((_func_exec, (stmt, self.shell.user_ns)),
                                timeout=timeout, interval=interval,
-                               max_usage=True, max_iterations=1,
+                               max_usage=True,
                                include_children=include_children)
             mem_usage.append(tmp)
 
@@ -1198,6 +1229,87 @@ def profile(func=None, stream=None, precision=1, backend='psutil'):
         return inner_wrapper
 
 
+
+from collections import defaultdict
+__stats = defaultdict(list)
+
+def statistics_profile(func=None, stream=None, precision=1, backend='psutil'):
+    """
+    Decorator that will run the function and print a line-by-line profile
+    """
+    backend = choose_backend(backend)
+    if backend == 'tracemalloc' and has_tracemalloc:
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+    if func is not None:
+        get_prof = partial(LineProfiler, backend=backend)
+        show_results_bound = partial(
+            show_results, stream=stream, precision=precision
+        )
+        if iscoroutinefunction(func):
+            @wraps(wrapped=func)
+            @coroutine
+            def wrapper(*args, **kwargs):
+                prof = get_prof()
+                val = yield from prof(func)(*args, **kwargs)
+                for (file, statistics) in prof.code_map.items():
+                    __stats[file].append(list(statistics))
+                return val
+        else:
+            @wraps(wrapped=func)
+            def wrapper(*args, **kwargs):
+                prof = get_prof()
+                val = prof(func)(*args, **kwargs)
+                for (file, statistics) in prof.code_map.items():
+                    __stats[file].append(list(statistics))
+                return val
+
+        return wrapper
+    else:
+        def inner_wrapper(f):
+            return statistics_profile(f, stream=stream, precision=precision,
+                           backend=backend)
+
+        return inner_wrapper
+
+
+
+def pretty_stats():
+    import pandas as pd
+    pd.set_option('display.max_columns', None)
+
+    for f, s in __stats.items():
+        df = defaultdict(list)
+        for trial_idx, trial in enumerate(s):
+            for row in trial:
+                df['trial'].append(trial_idx)
+                df['line_num'].append(row[0])
+                other_stats = row[1]
+                inc = None
+                total_mem = None
+                occurrences = None
+                if other_stats is not None:
+                    inc = other_stats[0]
+                    total_mem = other_stats[1]
+                    occurrences = other_stats[2]
+
+                df['inc'].append(inc)
+                df['total_mem'].append(total_mem)
+                df['occ'].append(occurrences)
+
+        df = pd.DataFrame(df)
+
+        df_mean = df.groupby('line_num').mean()
+        del df_mean['trial']
+        df_mean = df_mean.rename(columns={k: k+'_mean' for k in df_mean.columns})
+        df_sum = df.groupby('line_num').sum()
+        del df_sum['trial']
+        df_sum = df_sum.rename(columns={k: k+'_sum' for k in df_sum.columns})
+        df = df_mean.join(df_sum)
+        print("File:", f)
+        print(df)
+
+
 def choose_backend(new_backend=None):
     """
     Function that tries to setup backend, chosen by user, and if failed,
@@ -1248,8 +1360,7 @@ def exec_with_profiler(filename, profiler, backend, passed_args=[]):
     try:
         if _backend == 'tracemalloc' and has_tracemalloc:
             tracemalloc.start()
-
-        with io.open(filename, encoding='utf-8') as f:
+        with open(filename, encoding='utf-8') as f:
             exec(compile(f.read(), filename, 'exec'), ns, ns)
     finally:
         if has_tracemalloc and tracemalloc.is_tracing():
