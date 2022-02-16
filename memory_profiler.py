@@ -1276,7 +1276,6 @@ def statistics_profile(func=None, stream=None, precision=1, backend='psutil'):
 
 def pretty_stats():
     import pandas as pd
-    pd.set_option('display.max_columns', None)
 
     for f, s in __stats.items():
         df = defaultdict(list)
@@ -1294,7 +1293,6 @@ def pretty_stats():
                     occurrences = other_stats[2]
 
                 df['inc'].append(inc)
-                df['total_mem'].append(total_mem)
                 df['occ'].append(occurrences)
 
         df = pd.DataFrame(df)
@@ -1306,8 +1304,10 @@ def pretty_stats():
         del df_sum['trial']
         df_sum = df_sum.rename(columns={k: k+'_sum' for k in df_sum.columns})
         df = df_mean.join(df_sum)
-        print("File:", f)
-        print(df)
+        df = df.dropna()
+        with pd.option_context('display.max_rows', None, 'display.max_columns',None):  # more options can be specified also
+            print("File:", f)
+            print(df)
 
 
 def choose_backend(new_backend=None):
